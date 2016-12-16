@@ -1,3 +1,8 @@
+#ifndef DDEBUG
+#define DDEBUG 0
+#endif
+#include "ddebug.h"
+
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
@@ -235,11 +240,12 @@ ngx_http_sock_get_create_ctx(ngx_http_request_t *r)
 ngx_int_t
 ngx_http_sock_get_run_args(ngx_http_request_t *r, ngx_http_sock_get_args_t *arg)
 {
-    ngx_int_t                       len;
     ngx_int_t                       sockfd;
     ngx_http_sock_get_ctx_t        *ctx;
-    u_char                         *s   = NULL;
-    ngx_buf_t                      *buf = NULL;
+    ngx_chain_t                    *head;
+    u_char                         *s;
+    ngx_buf_t                      *buf;
+    ngx_int_t                       len;
     ngx_chain_t                    *cl  = NULL;
     
     ctx = ngx_http_get_module_ctx(r, ngx_http_sock_get_module);
@@ -257,35 +263,54 @@ ngx_http_sock_get_run_args(ngx_http_request_t *r, ngx_http_sock_get_args_t *arg)
         }
     }
 
-    len = recv(sockfd, buffer, BUFFER_SIZE, 0);
+    /* recieve until peer close */
+    while (1) {
+        len = recv(sockfd, buffer, BUFFER_SIZE, 0);
+        if (len <= 0) {
+            break;
+        }
+
+        s = ngx_palloc(r->pool, len);
+        if (s == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        
+        dd("buffer is %s", buffer);
+        dd("s is %s", s);
+        
+        ngx_memmove(s, buffer, len);
+        
+        buf = ngx_calloc_buf(r->pool);
+        if (buf == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        
+        buf->start = buf->pos = s;
+        buf->last = buf->end = s + len;
+        buf->memory = 1;
+
+        if (cl == NULL) {
+            cl = ngx_alloc_chain_link(r->pool);
+            if (cl == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            head = cl;
+        } else {
+            cl->next = ngx_alloc_chain_link(r->pool);
+            if (cl->next == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            cl = cl->next;
+        }
+
+        cl->buf = buf;
+        cl->next = NULL;
+
+    }
 
     close(sockfd);
 
-    s = ngx_palloc(r->pool, len);
-    if (s == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    
-    ngx_memmove(s, buffer, len);
-    
-    buf = ngx_calloc_buf(r->pool);
-    if (buf == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    
-    buf->start = buf->pos = s;
-    buf->last = buf->end = s + len;
-    buf->memory = 1;
-
-    cl = ngx_alloc_chain_link(r->pool);
-    if (cl == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    cl->buf = buf;
-    cl->next = NULL;
-
-    return ngx_http_sock_get_send_chain_link(r, ctx, cl);
+    return ngx_http_sock_get_send_chain_link(r, ctx, head);
 }
 
 
