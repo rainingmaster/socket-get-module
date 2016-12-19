@@ -32,6 +32,7 @@ typedef struct {
 } ngx_http_sock_get_args_t;
 
 typedef struct {
+    ngx_chain_t     *in;
     unsigned         header_sent:1;
 } ngx_http_sock_get_ctx_t;
 
@@ -237,80 +238,174 @@ ngx_http_sock_get_create_ctx(ngx_http_request_t *r)
 
 
 /* handlers */
+void
+ngx_http_sock_finalize_connection(ngx_connection_t *c, ngx_int_t rc)
+{
+    if (ngx_del_conn) {
+        ngx_del_conn(c, 0);
+    } else {
+        ngx_del_event(c->write, NGX_READ_EVENT, 0);
+    }
+    if (c->fd > 0) {
+        ngx_close_socket(c->fd);
+    }
+    
+    ngx_http_finalize_request((ngx_http_request_t *) c->data, rc);
+}
+
+
+static void
+ngx_http_sock_read_handler(ngx_event_t *ev)
+{
+    ngx_int_t                       len;
+    ngx_int_t                       rc;
+    u_char                         *s;
+    ngx_http_sock_get_ctx_t        *ctx;
+    ngx_connection_t               *c;
+    ngx_http_request_t             *r;
+    ngx_buf_t                      *buf;
+    ngx_chain_t                   **ll;
+    ngx_chain_t                    *cl;
+    
+    c = (ngx_connection_t *) ev->data;
+    r = (ngx_http_request_t *)c->data;
+    
+    ctx = ngx_http_get_module_ctx(r, ngx_http_sock_get_module);
+
+    len = recv(c->fd, buffer, BUFFER_SIZE, 0);
+    if (len <= 0) {
+        /* finish and send content */
+        if (ctx->in) {
+            rc = ngx_http_sock_get_send_chain_link(r, ctx, ctx->in);
+        }
+        
+        rc = ngx_http_sock_get_send_chain_link(r, ctx, NULL /* indicate LAST */);
+
+        if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+            ngx_http_sock_finalize_connection(c, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        if (!r->request_body) {
+            if (ngx_http_discard_request_body(r) != NGX_OK) {
+                ngx_http_sock_finalize_connection(c, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            }
+        }
+
+        ngx_http_sock_finalize_connection(c, NGX_DONE);
+        return;
+    }
+
+    s = ngx_palloc(r->pool, len);
+    if (s == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0, "[http socket] ngx_palloc() failed");
+        ngx_http_sock_finalize_connection(c, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    
+    dd("buffer is %s", buffer);
+    dd("s is %s", s);
+    
+    ngx_memmove(s, buffer, len);
+    
+    buf = ngx_create_temp_buf(r->pool, len);
+    if (buf == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0, "[http socket] ngx_create_temp_buf() failed");
+        ngx_http_sock_finalize_connection(c, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    
+    buf->start = buf->pos = s;
+    buf->last = buf->end = s + len;
+    buf->memory = 1;
+
+    for (cl = ctx->in, ll = &(ctx->in); cl; cl = cl->next) {
+        ll = &cl->next;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0, "[http socket] ngx_alloc_chain_link() failed");
+        return;
+    }
+
+    cl->buf = buf;
+    cl->next = NULL;
+    *ll = cl;
+    
+    return;
+}
+
+
+ngx_int_t
+ngx_http_sock_read(ngx_http_request_t *r, ngx_int_t sockfd)
+{
+    u_char                          *p = NULL;
+    ngx_connection_t                *c;
+    ngx_event_t                     *rev;
+
+    p = ngx_palloc(r->pool, sizeof(ngx_connection_t) + sizeof(ngx_event_t));
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+    
+    c = (ngx_connection_t *)p;
+    
+    p += sizeof(ngx_connection_t);
+    rev = (ngx_event_t *) p;
+
+    c->fd = sockfd;
+    c->error = 0;
+    c->read = rev;
+    c->write = rev;
+    c->data = r;
+    c->log = r->connection->log;
+
+    rev->active = 0;
+    rev->data = c;
+    rev->handler = ngx_http_sock_read_handler;
+    rev->log = r->connection->log;
+    if (ngx_add_event(rev, NGX_READ_EVENT, 0) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno, "[http socket] ngx_add_event() failed");
+        return NGX_ERROR;
+    }
+    
+    r->count++;
+    
+    return NGX_OK;
+}
+
+
 ngx_int_t
 ngx_http_sock_get_run_args(ngx_http_request_t *r, ngx_http_sock_get_args_t *arg)
 {
     ngx_int_t                       sockfd;
+    ngx_int_t                       rc;
     ngx_http_sock_get_ctx_t        *ctx;
-    ngx_chain_t                    *head;
-    u_char                         *s;
-    ngx_buf_t                      *buf;
-    ngx_int_t                       len;
-    ngx_chain_t                    *cl  = NULL;
     
     ctx = ngx_http_get_module_ctx(r, ngx_http_sock_get_module);
 
     //gethostbyname((char *) host);
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (connect(sockfd, (struct sockaddr *)&(arg->servaddr), sizeof(arg->servaddr)) < 0) {
+    sockfd = ngx_socket(AF_INET, SOCK_STREAM, 0);
+    rc = connect(sockfd, (struct sockaddr *)&(arg->servaddr), sizeof(arg->servaddr));
+    if (rc < 0) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno, "[http socket] connect() failed");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
     if (arg->content.data) {
         if (send(sockfd, arg->content.data, arg->content.len, 0) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno, "[http socket] send() failed");
+            ngx_close_socket(sockfd);
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
+    
+    ngx_http_sock_read(r, sockfd);
 
-    /* recieve until peer close */
-    while (1) {
-        len = recv(sockfd, buffer, BUFFER_SIZE, 0);
-        if (len <= 0) {
-            break;
-        }
-
-        s = ngx_palloc(r->pool, len);
-        if (s == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        
-        dd("buffer is %s", buffer);
-        dd("s is %s", s);
-        
-        ngx_memmove(s, buffer, len);
-        
-        buf = ngx_calloc_buf(r->pool);
-        if (buf == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        
-        buf->start = buf->pos = s;
-        buf->last = buf->end = s + len;
-        buf->memory = 1;
-
-        if (cl == NULL) {
-            cl = ngx_alloc_chain_link(r->pool);
-            if (cl == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-            head = cl;
-        } else {
-            cl->next = ngx_alloc_chain_link(r->pool);
-            if (cl->next == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-            cl = cl->next;
-        }
-
-        cl->buf = buf;
-        cl->next = NULL;
-
-    }
-
-    close(sockfd);
-
-    return ngx_http_sock_get_send_chain_link(r, ctx, head);
+    return NGX_DONE;
 }
 
 
@@ -345,18 +440,6 @@ ngx_http_sock_get_handler(ngx_http_request_t *r)
 
         if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;
-        }
-    }
-    
-    rc = ngx_http_sock_get_send_chain_link(r, ctx, NULL /* indicate LAST */);
-
-    if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-        return rc;
-    }
-
-    if (!r->request_body) {
-        if (ngx_http_discard_request_body(r) != NGX_OK) {
-            return NGX_ERROR;
         }
     }
 
