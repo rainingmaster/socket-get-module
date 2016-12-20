@@ -382,11 +382,6 @@ ngx_http_sock_get_run_args(ngx_http_request_t *r, ngx_http_sock_get_args_t *arg)
 {
     ngx_int_t                       sockfd;
     ngx_int_t                       rc;
-    ngx_http_sock_get_ctx_t        *ctx;
-
-    ctx = ngx_http_get_module_ctx(r, ngx_http_sock_get_module);
-
-    //gethostbyname((char *) host);
 
     sockfd = ngx_socket(AF_INET, SOCK_STREAM, 0);
     rc = connect(sockfd, (struct sockaddr *)&(arg->servaddr), sizeof(arg->servaddr));
